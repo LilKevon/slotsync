@@ -9,12 +9,14 @@ from playwright.sync_api import (
 
 from pathlib import Path
 # Configuration
-URL = "https://cityofmarkham.perfectmind.com/Clients/BookMe4LandingPages/Class?widgetId=6825ea71-e5b7-4c2a-948f-9195507ad90a&redirectedFromEmbededMode=False&classId=3892f0ea-9243-4a60-b1b9-174f63460ae4&occurrenceDate=20260905"
+URL = "https://cityofmarkham.perfectmind.com/Clients/BookMe4LandingPages/Class?widgetId=6825ea71-e5b7-4c2a-948f-9195507ad90a&redirectedFromEmbededMode=False&classId=49670327-a50c-4afa-98f1-b8184ea1cc07&occurrenceDate=20260906"
 TORONTO_TZ = ZoneInfo("America/Toronto")
 
-FIRST_REFRESH_EARLY_MS = 350
+FIRST_REFRESH_EARLY_MS = 250
 STATE_DETECTION_TIMEOUT_MS = 1000
 
+SESSION_KEEPALIVE_SECONDS = 180
+KEEPALIVE_CUTOFF_SECONDS = 15
 
 ACCOUNTS_DIR = Path("accounts")
 
@@ -24,6 +26,11 @@ if not account_name.endswith(".json"):
     account_name += ".json"
 
 AUTH_FILE = ACCOUNTS_DIR / account_name
+
+PREFERRED_PARTICIPANT = input(
+    "Preferred participant name "
+    "(leave blank to auto-select/choose later): "
+).strip()
 
 def now():
     return datetime.now(TORONTO_TZ)
@@ -85,6 +92,14 @@ def install_fast_booking_hook(page):
         (() => {
 
             if (window.top !== window) {
+                return;
+            }
+
+            if (
+                !location.pathname.includes(
+                    "/Clients/BookMe4LandingPages/Class"
+                )
+            ) {
                 return;
             }
 
@@ -816,6 +831,415 @@ def find_latest_fast_action(history):
 
     return None
 
+
+def select_participant_and_continue(
+    page,
+    preferred_name="",
+    timeout_ms=15000,
+):
+    """
+    Select one attendee on PerfectMind's participant page,
+    wait for the site's own validation/hold logic, then click Next.
+    """
+
+    try:
+        page.wait_for_url(
+            "**/Clients/BookMe4EventParticipants**",
+            timeout=timeout_ms,
+        )
+    except PlaywrightTimeoutError:
+        print(
+            "Attendee page did not appear within "
+            f"{timeout_ms} ms."
+        )
+        return False
+
+    rows = page.locator(
+        "#event-attendees .bm-selectable-row"
+    )
+
+    try:
+        rows.first.wait_for(
+            state="attached",
+            timeout=timeout_ms,
+        )
+    except PlaywrightTimeoutError:
+        print("Could not find the participant list.")
+        return False
+
+    members = []
+
+    for i in range(rows.count()):
+        row = rows.nth(i)
+
+        name_input = row.locator(
+            'input[name$=".FullNameSimple"]'
+        )
+        checkbox = row.locator(
+            'input[type="checkbox"]'
+            '[name$=".IsParticipating"]'
+        )
+
+        if (
+            name_input.count() == 0
+            or checkbox.count() == 0
+        ):
+            continue
+
+        name = (
+            name_input.get_attribute("value")
+            or ""
+        ).strip()
+
+        if not name:
+            continue
+
+        members.append(
+            {
+                "name": name,
+                "checkbox": checkbox,
+            }
+        )
+
+    if not members:
+        print("No selectable participants were found.")
+        return False
+
+    target = None
+
+    if preferred_name:
+        wanted = preferred_name.casefold()
+
+        for member in members:
+            if member["name"].casefold() == wanted:
+                target = member
+                break
+
+        if target is None:
+            print()
+            print(
+                f'Participant "{preferred_name}" '
+                "was not found."
+            )
+
+    if target is None and len(members) == 1:
+        target = members[0]
+        print(
+            "Participant       :",
+            target["name"],
+            "(auto-selected)",
+        )
+
+    elif target is None:
+        print()
+        print("Available participants:")
+
+        for index, member in enumerate(
+            members,
+            start=1,
+        ):
+            print(
+                f"  {index}. {member['name']}"
+            )
+
+        while True:
+            choice = input(
+                "Select participant number: "
+            ).strip()
+
+            try:
+                selected_index = int(choice) - 1
+            except ValueError:
+                print("Please enter a number.")
+                continue
+
+            if 0 <= selected_index < len(members):
+                target = members[selected_index]
+                break
+
+            print("That participant number is invalid.")
+
+    else:
+        print(
+            "Participant       :",
+            target["name"],
+        )
+
+    # Ensure only the chosen participant is selected.
+    for member in members:
+        checkbox = member["checkbox"]
+
+        try:
+            checked = checkbox.is_checked()
+            enabled = checkbox.is_enabled()
+        except Exception:
+            continue
+
+        if (
+            member is not target
+            and checked
+            and enabled
+        ):
+            checkbox.click()
+
+    target_checkbox = target["checkbox"]
+
+    try:
+        if not target_checkbox.is_checked():
+            target_checkbox.click()
+    except Exception as e:
+        print(
+            "Could not select participant:",
+            e,
+        )
+        return False
+
+    print(
+        "Selected participant:",
+        target["name"],
+    )
+
+    # PerfectMind enables Next only after its own validation
+    # and hold logic finishes.
+    try:
+        page.wait_for_function(
+            """
+            () => {
+                const next =
+                    document.querySelector(
+                        ".bm-form-navbar "
+                        + ".next-btn-container a"
+                    );
+
+                return (
+                    next
+                    && !next.classList.contains(
+                        "disabled"
+                    )
+                    && !next.hasAttribute(
+                        "disabled"
+                    )
+                );
+            }
+            """,
+            timeout=timeout_ms,
+            polling=10,
+        )
+    except PlaywrightTimeoutError:
+        print(
+            "Next did not become available after "
+            "participant validation."
+        )
+        return False
+
+    try:
+        page.locator(
+            ".bm-form-navbar "
+            ".next-btn-container a"
+        ).click()
+    except Exception as e:
+        print("Could not click Next:", e)
+        return False
+
+    print("NEXT ACTION FIRED")
+    return True
+
+
+def select_free_activity_pass_and_continue(
+    page,
+    timeout_ms=15000,
+):
+    """
+    On PerfectMind's Fees/Extras page:
+      1. find exactly "REC: Admission - Activity Pass",
+      2. verify its amount is $0.00,
+      3. select its real radio input,
+      4. click the page's Next/Add to Cart button.
+    """
+
+    try:
+        page.locator("#btnNext").wait_for(
+            state="attached",
+            timeout=timeout_ms,
+        )
+    except PlaywrightTimeoutError:
+        print("Fees/Extras page did not appear.")
+        return False
+
+    fee_rows = page.locator(
+        ".bm-extras-prices tr.radio-item"
+    )
+
+    target_radio = None
+
+    for i in range(fee_rows.count()):
+        row = fee_rows.nth(i)
+
+        name_locator = row.locator(
+            ".fee-name-item"
+        )
+        amount_locator = row.locator(
+            ".bm-extras-price-amount"
+        )
+        radio = row.locator(
+            'input[type="radio"]'
+        )
+
+        if (
+            name_locator.count() == 0
+            or amount_locator.count() == 0
+            or radio.count() == 0
+        ):
+            continue
+
+        fee_name = (
+            name_locator.inner_text()
+            or ""
+        ).strip()
+
+        raw_amount = (
+            amount_locator.get_attribute("value")
+            or ""
+        ).strip()
+
+        try:
+            amount = float(raw_amount)
+        except ValueError:
+            continue
+
+        if (
+            fee_name
+            == "REC: Admission - Activity Pass"
+            and amount == 0.0
+        ):
+            target_radio = radio
+            break
+
+    if target_radio is None:
+        print(
+            "ERROR: Free Activity Pass was not found. "
+            "SlotSync will not select another fee."
+        )
+        return False
+
+    try:
+        if not target_radio.is_checked():
+            target_radio.click()
+    except Exception as e:
+        print(
+            "Could not select free Activity Pass:",
+            e,
+        )
+        return False
+
+    try:
+        if not target_radio.is_checked():
+            print(
+                "ERROR: Free Activity Pass did not remain selected."
+            )
+            return False
+    except Exception:
+        return False
+
+    print(
+        "Fee selected       : "
+        "REC: Admission - Activity Pass (Free)"
+    )
+
+    next_button = page.locator("#btnNext")
+
+    try:
+        page.wait_for_function(
+            """
+            () => {
+                const button =
+                    document.getElementById("btnNext");
+
+                return (
+                    button
+                    && !button.classList.contains("disabled")
+                    && !button.hasAttribute("disabled")
+                );
+            }
+            """,
+            timeout=timeout_ms,
+            polling=10,
+        )
+    except PlaywrightTimeoutError:
+        print(
+            "Fees/Extras Next button did not become available."
+        )
+        return False
+
+    try:
+        next_button.click()
+    except Exception as e:
+        print(
+            "Could not click Fees/Extras Next:",
+            e,
+        )
+        return False
+
+    print("FEES/EXTRAS NEXT FIRED")
+    return True
+
+
+def wait_for_checkout(
+    page,
+    timeout_ms=20000,
+):
+    """
+    Wait for the checkout page and its embedded online-store frame.
+
+    The final Place My Order action is intentionally left commented
+    out for now.
+    """
+
+    try:
+        page.locator(
+            "iframe.online-store"
+        ).wait_for(
+            state="attached",
+            timeout=timeout_ms,
+        )
+    except PlaywrightTimeoutError:
+        print(
+            "Checkout iframe did not appear within "
+            f"{timeout_ms} ms."
+        )
+        return False
+
+    print("Checkout loaded.")
+
+    # ---------------------------------------------------------
+    # PLACE MY ORDER — INTENTIONALLY DISABLED FOR NOW
+    # ---------------------------------------------------------
+    #
+    # checkout_frame = page.frame_locator(
+    #     "iframe.online-store"
+    # )
+    #
+    # place_order_button = (
+    #     checkout_frame.get_by_role(
+    #         "button",
+    #         name="Place My Order",
+    #         exact=True,
+    #     )
+    # )
+    #
+    # place_order_button.wait_for(
+    #     state="visible",
+    #     timeout=15000,
+    # )
+    #
+    # place_order_button.click()
+    #
+    # print("PLACE MY ORDER FIRED")
+    #
+    # ---------------------------------------------------------
+
+    return True
+
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=False)
     context = browser.new_context(storage_state=AUTH_FILE)
@@ -859,18 +1283,111 @@ with sync_playwright() as p:
 
     last_display = None
 
+    next_keepalive = (
+        now()
+        + timedelta(
+            seconds=SESSION_KEEPALIVE_SECONDS
+        )
+    )
+
     while True:
-        remaining = (target_refresh - now()).total_seconds()
+
+        current_time = now()
+        remaining = (
+            target_refresh - current_time
+        ).total_seconds()
 
         if remaining <= 0:
             break
+
+    #
+    # Refresh session every 3 minutes while waiting.
+    # Use page.goto() instead of reload() because it
+    # tends to keep PerfectMind sessions alive more
+    # reliably.
+    #
+        if (
+            current_time >= next_keepalive
+            and remaining > KEEPALIVE_CUTOFF_SECONDS
+        ):
+            try:
+
+                print()
+                print(
+                    f"[{fmt(current_time)}] "
+                    "KEEPALIVE NAVIGATION..."
+                )
+
+                page.goto(
+                    URL,
+                    wait_until="domcontentloaded",
+                    timeout=15000,
+                )
+
+                if "login" in page.url.lower():
+                    print(
+                        "ERROR: PerfectMind session expired."
+                    )
+                    print(
+                        "Run login.py again."
+                    )
+                    browser.close()
+                    raise SystemExit
+
+                refreshed_info = get_event_info(page)
+
+                if refreshed_info:
+                    resident_opening = (
+                        parse_perfectmind_time(
+                            refreshed_info[
+                                "ResidentsRegistrationDateValue"
+                            ]
+                        )
+                    )
+
+                    target_refresh = (
+                        resident_opening
+                        - timedelta(
+                            milliseconds=
+                            FIRST_REFRESH_EARLY_MS
+                        )
+                    )
+
+                    print(
+                        "Updated opening :",
+                        resident_opening.strftime(
+                            "%Y-%m-%d %I:%M:%S.%f %p %Z"
+                        )[:-7],
+                    )
+
+                print(
+                    f"[{fmt(now())}] "
+                    "KEEPALIVE COMPLETE"
+                )
+
+            except Exception as e:
+                print(
+                    f"Keepalive failed: {e}"
+                )
+
+            next_keepalive = (
+                now()
+                + timedelta(
+                    seconds=
+                    SESSION_KEEPALIVE_SECONDS
+                )
+            )
+
+            continue
 
         if remaining > 5:
             display = f"{remaining:5.1f}s"
         elif remaining > 1:
             display = f"{remaining:5.2f}s"
         else:
-            display = f"{remaining * 1000:6.0f} ms"
+            display = (
+                f"{remaining * 1000:6.0f} ms"
+            )
 
         if display != last_display:
             print(
@@ -886,7 +1403,6 @@ with sync_playwright() as p:
             time.sleep(0.005)
         else:
             time.sleep(0.001)
-
     print("\r" + " " * 50 + "\r", end="")
     print()
     print("================================")
@@ -999,9 +1515,44 @@ with sync_playwright() as p:
 
     print()
     print("================================")
-    print("BOOKING ACTION FIRED" if success else "BOOKING ATTEMPT FAILED")
+    print(
+        "BOOKING ACTION FIRED"
+        if success
+        else "BOOKING ATTEMPT FAILED"
+    )
     print("================================")
     print()
+
+    if success:
+        attendee_success = (
+            select_participant_and_continue(
+                page,
+                preferred_name=
+                    PREFERRED_PARTICIPANT,
+            )
+        )
+
+        if attendee_success:
+            print()
+            print("==============================")
+            print("ATTENDEE SELECTED + NEXT FIRED")
+            print("==============================")
+            print()
+
+            fee_success = (
+                select_free_activity_pass_and_continue(
+                    page
+                )
+            )
+
+            if fee_success:
+                print()
+                print("==============================")
+                print("FREE ACTIVITY PASS + NEXT FIRED")
+                print("==============================")
+                print()
+
+                wait_for_checkout(page)
 
     input("Press Enter to close...")
     browser.close()
