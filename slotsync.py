@@ -9,28 +9,19 @@ from playwright.sync_api import (
 
 from pathlib import Path
 # Configuration
-URL = "https://cityofmarkham.perfectmind.com/Clients/BookMe4LandingPages/Class?widgetId=6825ea71-e5b7-4c2a-948f-9195507ad90a&redirectedFromEmbededMode=False&classId=49670327-a50c-4afa-98f1-b8184ea1cc07&occurrenceDate=20260906"
+URL = ""
 TORONTO_TZ = ZoneInfo("America/Toronto")
 
-FIRST_REFRESH_EARLY_MS = 250
+FIRST_REFRESH_EARLY_MS = 100
 STATE_DETECTION_TIMEOUT_MS = 1000
 
 SESSION_KEEPALIVE_SECONDS = 180
 KEEPALIVE_CUTOFF_SECONDS = 15
 
 ACCOUNTS_DIR = Path("accounts")
+LOGIN_URL = "https://cityofmarkham.perfectmind.com/"
 
-account_name = input("Enter account JSON name: ").strip()
-
-if not account_name.endswith(".json"):
-    account_name += ".json"
-
-AUTH_FILE = ACCOUNTS_DIR / account_name
-
-PREFERRED_PARTICIPANT = input(
-    "Preferred participant name "
-    "(leave blank to auto-select/choose later): "
-).strip()
+PREFERRED_PARTICIPANT = ""
 
 def now():
     return datetime.now(TORONTO_TZ)
@@ -45,6 +36,344 @@ def parse_perfectmind_time(value):
     naive = datetime.fromisoformat(value)
 
     return naive.replace(tzinfo=TORONTO_TZ)
+
+
+def safe_account_filename(email):
+    """
+    Turn an email address into a simple local JSON filename.
+    The password is never written to this file.
+    """
+    safe = "".join(
+        char if char.isalnum() or char in ("-", "_", ".")
+        else "_"
+        for char in email.strip().lower()
+    ).strip("._")
+
+    if not safe:
+        safe = "account"
+
+    return f"{safe}.json"
+
+
+def looks_logged_out(page):
+    """
+    Detect the actual PerfectMind sign-in form.
+
+    The page can contain other Email/password-like controls, so only
+    the real sign-in username/password fields are considered here.
+    """
+    try:
+        return page.evaluate(
+            """
+            () => {
+                const username =
+                    document.querySelector("#textBoxUsername");
+                const password =
+                    document.querySelector("#textBoxPassword");
+
+                const visible = (el) => {
+                    if (!el) {
+                        return false;
+                    }
+
+                    const style =
+                        window.getComputedStyle(el);
+
+                    return (
+                        style.display !== "none"
+                        && style.visibility !== "hidden"
+                        && el.offsetParent !== null
+                    );
+                };
+
+                return (
+                    visible(username)
+                    && visible(password)
+                );
+            }
+            """
+        )
+
+    except Exception:
+        return False
+
+
+def login_to_perfectmind(
+    browser,
+    email,
+    password,
+    auth_file,
+):
+    """
+    Log in through PerfectMind's normal login form and save
+    Playwright storage state for later runs.
+    """
+    context = browser.new_context()
+    page = context.new_page()
+
+    print()
+    print("Logging into PerfectMind...")
+
+    try:
+        page.goto(
+            LOGIN_URL,
+            wait_until="domcontentloaded",
+            timeout=20000,
+        )
+
+        
+        email_field = page.locator(
+            "#textBoxUsername"
+        )
+
+        password_field = page.locator(
+            "#textBoxPassword"
+        )
+
+        if password_field.count() == 0:
+            password_field = page.locator(
+                'input[type="password"]:visible'
+            ).first
+
+        login_button = page.locator(
+            '#buttonLogin, '
+            'button:has-text("Login"), '
+            'input[type="submit"][value="Login"]'
+        ).first
+
+        email_field.wait_for(
+            state="visible",
+            timeout=10000,
+        )
+        password_field.wait_for(
+            state="visible",
+            timeout=10000,
+        )
+        login_button.wait_for(
+            state="visible",
+            timeout=10000,
+        )
+
+        email_field.fill(email)
+        password_field.fill(password)
+        login_button.click()
+
+     
+        try:
+            page.wait_for_function(
+                """
+                () => {
+                    const username =
+                        document.querySelector("#textBoxUsername");
+                    const password =
+                        document.querySelector("#textBoxPassword");
+
+                    const visible = (el) => {
+                        if (!el) {
+                            return false;
+                        }
+
+                        const style =
+                            window.getComputedStyle(el);
+
+                        return (
+                            style.display !== "none"
+                            && style.visibility !== "hidden"
+                            && el.offsetParent !== null
+                        );
+                    };
+
+                    return (
+                        !visible(username)
+                        || !visible(password)
+                    );
+                }
+                """,
+                timeout=20000,
+                polling=100,
+            )
+        except PlaywrightTimeoutError:
+            print()
+            print(
+                "ERROR: Login form never disappeared. "
+                "Please check the email/password."
+            )
+            context.close()
+            return None, None
+
+        print("Login form cleared.")
+
+        ACCOUNTS_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        context.storage_state(
+            path=str(auth_file)
+        )
+
+        print("Login successful.")
+        print(
+            "Saved session     :",
+            auth_file,
+        )
+
+        return context, page
+
+    except Exception as e:
+        print()
+        print("ERROR: Automatic login failed:")
+        print(e)
+
+        try:
+            context.close()
+        except Exception:
+            pass
+
+        return None, None
+
+
+def open_slotsync_session(browser):
+    """
+    Ask for an email and booking-page link, reuse a saved
+    session when possible, otherwise log in automatically and
+    save a fresh session. Then land directly on that booking page.
+    """
+    print()
+    print("================================")
+    print("           SlotSync")
+    print("================================")
+    print()
+
+    global URL
+
+    global PREFERRED_PARTICIPANT
+
+    PREFERRED_PARTICIPANT = input(
+        "Preferred participant "
+        "(blank = auto/select later): "
+    ).strip()
+
+    email = input("PerfectMind email: ").strip()
+
+    if not email:
+        print("ERROR: Email is required.")
+        return None, None, None
+
+    URL = input(
+        "Booking page link: "
+    ).strip()
+
+    if not URL:
+        print("ERROR: Booking page link is required.")
+        return None, None, None
+
+    if not (
+        URL.startswith("https://")
+        or URL.startswith("http://")
+    ):
+        print(
+            "ERROR: Booking page link must start with "
+            "http:// or https://"
+        )
+        return None, None, None
+
+    ACCOUNTS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    auth_file = (
+        ACCOUNTS_DIR
+        / safe_account_filename(email)
+    )
+
+    if auth_file.exists():
+        print()
+        print("Saved login found.")
+        print("Checking session...")
+
+        try:
+            context = browser.new_context(
+                storage_state=str(auth_file)
+            )
+            page = context.new_page()
+
+            page.goto(
+                URL,
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+
+            if not looks_logged_out(page):
+                print("Session still valid.")
+                print("Booking page loaded.")
+
+                context.storage_state(
+                    path=str(auth_file)
+                )
+
+                return context, page, auth_file
+
+            context.close()
+            print("Saved session expired.")
+
+        except Exception:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+            print(
+                "Saved session could not be used."
+            )
+
+    password = input(
+        "PerfectMind password: "
+    )
+
+    context, page = login_to_perfectmind(
+        browser,
+        email,
+        password,
+        auth_file,
+    )
+
+    password = None
+
+    if context is None:
+        return None, None, None
+
+    print("Loading booking page...")
+
+    try:
+        page.goto(
+            URL,
+            wait_until="domcontentloaded",
+            timeout=20000,
+        )
+    except Exception as e:
+        print(
+            "ERROR: Could not load booking page:",
+            e,
+        )
+        context.close()
+        return None, None, None
+
+    if looks_logged_out(page):
+        print(
+            "ERROR: PerfectMind returned to the login page."
+        )
+        context.close()
+        return None, None, None
+
+    context.storage_state(
+        path=str(auth_file)
+    )
+
+    print("Booking page loaded.")
+
+    return context, page, auth_file
 
 def get_event_info(page):
     try:
@@ -999,8 +1328,6 @@ def select_participant_and_continue(
         target["name"],
     )
 
-    # PerfectMind enables Next only after its own validation
-    # and hold logic finishes.
     try:
         page.wait_for_function(
             """
@@ -1210,7 +1537,7 @@ def wait_for_checkout(
         return False
 
     print("Checkout loaded.")
-
+    #UNDISABLE
     # ---------------------------------------------------------
     # PLACE MY ORDER — INTENTIONALLY DISABLED FOR NOW
     # ---------------------------------------------------------
@@ -1242,18 +1569,12 @@ def wait_for_checkout(
 
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=False)
-    context = browser.new_context(storage_state=AUTH_FILE)
-    page = context.new_page()
 
+    context, page, AUTH_FILE = (
+        open_slotsync_session(browser)
+    )
 
-    install_fast_booking_hook(page)
-
-    print("Loading booking page...")
-    page.goto(URL, wait_until="domcontentloaded")
-
-    if "login" in page.url.lower():
-        print("ERROR: PerfectMind session expired.")
-        print("Run login.py again.")
+    if context is None:
         browser.close()
         raise SystemExit
 
@@ -1269,6 +1590,10 @@ with sync_playwright() as p:
     target_refresh = resident_opening - timedelta(
         milliseconds=FIRST_REFRESH_EARLY_MS
     )
+
+    # Install the fast hook only AFTER the initial booking page load.
+    # This keeps already-open test pages from firing Register during setup.
+    install_fast_booking_hook(page)
 
     print()
     print(
@@ -1329,7 +1654,7 @@ with sync_playwright() as p:
                         "ERROR: PerfectMind session expired."
                     )
                     print(
-                        "Run login.py again."
+                        "Restart SlotSync to sign in again."
                     )
                     browser.close()
                     raise SystemExit
