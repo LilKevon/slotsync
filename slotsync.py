@@ -1,4 +1,6 @@
 import time
+import os
+import platform
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -22,6 +24,23 @@ ACCOUNTS_DIR = Path("accounts")
 LOGIN_URL = "https://cityofmarkham.perfectmind.com/"
 
 PREFERRED_PARTICIPANT = ""
+
+# Logging configuration
+GOOGLE_CREDENTIALS_FILE = Path(
+    "secrets/service_account.json"
+)
+GOOGLE_SHEET_URL_FILE = Path(
+    "secrets/google_sheet_url.txt"
+)
+GOOGLE_WORKSHEET_NAME = "Runs"
+
+# Friendly label override:
+#   set SLOTSYNC_COMPUTER_NAME=Parents-PC
+COMPUTER_NAME = (
+    os.getenv("SLOTSYNC_COMPUTER_NAME", "").strip()
+    or platform.node()
+    or "Unknown computer"
+)
 
 def now():
     return datetime.now(TORONTO_TZ)
@@ -121,7 +140,9 @@ def login_to_perfectmind(
             timeout=20000,
         )
 
-        
+        # Use the actual PerfectMind sign-in controls directly.
+        # The page also contains a separate signup Email field,
+        # so get_by_label("Email") is ambiguous.
         email_field = page.locator(
             "#textBoxUsername"
         )
@@ -158,7 +179,9 @@ def login_to_perfectmind(
         password_field.fill(password)
         login_button.click()
 
-     
+        # Wait specifically for PerfectMind's real sign-in form to
+        # disappear. Other signup/profile fields on the page should
+        # not keep SlotSync stuck in the login loop.
         try:
             page.wait_for_function(
                 """
@@ -243,6 +266,8 @@ def open_slotsync_session(browser):
     print("================================")
     print("           SlotSync")
     print("================================")
+    print()
+    print("Computer          :", COMPUTER_NAME)
     print()
 
     global URL
@@ -374,6 +399,143 @@ def open_slotsync_session(browser):
     print("Booking page loaded.")
 
     return context, page, auth_file
+
+
+def _log_fieldnames():
+    return [
+        "timestamp",
+        "computer",
+        "event_url",
+        "participant",
+        "resident_opening",
+        "refresh_lead_ms",
+        "refresh_started",
+        "response_committed",
+        "refresh_to_commit_ms",
+        "commit_to_action_ms",
+        "open_detected",
+        "booking_action_time",
+        "booking_action_fired",
+        "attendee_next_fired",
+        "free_activity_pass_fired",
+        "checkout_loaded",
+        "result",
+    ]
+
+
+
+def upload_log_to_google_sheet(row):
+    """
+    Google Sheets logging.
+    Runs only after the time-sensitive booking flow.
+    """
+    if not GOOGLE_CREDENTIALS_FILE.exists():
+        print(
+            "Cloud logging skipped: "
+            "missing secrets/google_credentials.json"
+        )
+        return False
+
+    if not GOOGLE_SHEET_URL_FILE.exists():
+        print(
+            "Cloud logging skipped: "
+            "missing secrets/google_sheet_url.txt"
+        )
+        return False
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError:
+        print(
+            "Cloud logging skipped: install with "
+            "'py -m pip install gspread google-auth'"
+        )
+        return False
+
+    try:
+        sheet_url = (
+            GOOGLE_SHEET_URL_FILE.read_text(
+                encoding="utf-8"
+            ).strip()
+        )
+
+        if not sheet_url:
+            print(
+                "Cloud logging skipped: "
+                "google_sheet_url.txt is empty."
+            )
+            return False
+
+        credentials = Credentials.from_service_account_file(
+            str(GOOGLE_CREDENTIALS_FILE),
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+
+        client = gspread.authorize(credentials)
+        spreadsheet = client.open_by_url(sheet_url)
+
+        try:
+            worksheet = spreadsheet.worksheet(
+                GOOGLE_WORKSHEET_NAME
+            )
+        except gspread.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(
+                title=GOOGLE_WORKSHEET_NAME,
+                rows=1000,
+                cols=20,
+            )
+
+        fields = _log_fieldnames()
+
+        if not worksheet.row_values(1):
+            worksheet.append_row(
+                fields,
+                value_input_option="RAW",
+            )
+
+        worksheet.append_row(
+            [row.get(field, "") for field in fields],
+            value_input_option="RAW",
+        )
+
+        print(
+            "Google log saved  :",
+            GOOGLE_WORKSHEET_NAME,
+        )
+        return True
+
+    except Exception as e:
+        print("Cloud logging failed:", e)
+        return False
+
+
+def record_run_log(row):
+    row["timestamp"] = now().isoformat()
+    row["computer"] = COMPUTER_NAME
+
+    upload_log_to_google_sheet(row)
+
+
+def action_wall_to_local_time(action_record):
+    if not action_record:
+        return ""
+
+    action_wall = action_record.get("actionWall")
+
+    if action_wall is None:
+        return ""
+
+    try:
+        return datetime.fromtimestamp(
+            action_wall / 1000,
+            tz=TORONTO_TZ,
+        ).isoformat()
+    except Exception:
+        return ""
 
 def get_event_info(page):
     try:
@@ -1328,6 +1490,8 @@ def select_participant_and_continue(
         target["name"],
     )
 
+    # PerfectMind enables Next only after its own validation
+    # and hold logic finishes.
     try:
         page.wait_for_function(
             """
@@ -1537,7 +1701,7 @@ def wait_for_checkout(
         return False
 
     print("Checkout loaded.")
-    #UNDISABLE
+
     # ---------------------------------------------------------
     # PLACE MY ORDER — INTENTIONALLY DISABLED FOR NOW
     # ---------------------------------------------------------
@@ -1735,6 +1899,12 @@ with sync_playwright() as p:
     print("================================")
 
     success = False
+    committed = None
+    detected_open = None
+    latest_action_record = None
+    attendee_success = False
+    fee_success = False
+    checkout_success = False
 
     print()
     print("============== ATTEMPT 1 ==============")
@@ -1785,6 +1955,7 @@ with sync_playwright() as p:
             action_record = find_latest_fast_action(history)
 
             if action_record:
+                latest_action_record = action_record
                 success = True
                 break
 
@@ -1799,6 +1970,8 @@ with sync_playwright() as p:
                     print("State signal       :", fmt(state_time))
                     print("PerfectMind OPEN   :", fmt(state_time))
                     print("Browser fast-path active...")
+                    if detected_open is None:
+                        detected_open = state_time
                     open_announced = True
                     state = None
 
@@ -1877,7 +2050,101 @@ with sync_playwright() as p:
                 print("==============================")
                 print()
 
-                wait_for_checkout(page)
+                checkout_success = (
+                    wait_for_checkout(page)
+                )
+
+    # Logging happens only after all time-sensitive booking work.
+    refresh_to_commit_ms = ""
+
+    if committed is not None:
+        refresh_to_commit_ms = round(
+            ms_between(
+                refresh_started,
+                committed,
+            ),
+            2,
+        )
+
+    if latest_action_record is None:
+        try:
+            latest_action_record = find_latest_fast_action(
+                get_fast_action_history(page)
+            )
+        except Exception:
+            latest_action_record = None
+
+    commit_to_action_ms = ""
+
+    if (
+        committed is not None
+        and latest_action_record is not None
+        and latest_action_record.get("actionWall") is not None
+    ):
+        try:
+            action_dt = datetime.fromtimestamp(
+                latest_action_record["actionWall"] / 1000,
+                tz=TORONTO_TZ,
+            )
+
+            commit_to_action_ms = round(
+                ms_between(
+                    committed,
+                    action_dt,
+                ),
+                2,
+            )
+        except Exception:
+            commit_to_action_ms = ""
+
+    run_log = {
+        "event_url": URL,
+        "participant": PREFERRED_PARTICIPANT,
+        "resident_opening": resident_opening.isoformat(),
+        "refresh_lead_ms": FIRST_REFRESH_EARLY_MS,
+        "refresh_started": refresh_started.isoformat(),
+        "response_committed": (
+            committed.isoformat()
+            if committed is not None
+            else ""
+        ),
+        "refresh_to_commit_ms": refresh_to_commit_ms,
+        "commit_to_action_ms": commit_to_action_ms,
+        "open_detected": (
+            detected_open.isoformat()
+            if detected_open is not None
+            else ""
+        ),
+        "booking_action_time": action_wall_to_local_time(
+            latest_action_record
+        ),
+        "booking_action_fired": success,
+        "attendee_next_fired": attendee_success,
+        "free_activity_pass_fired": fee_success,
+        "checkout_loaded": checkout_success,
+        "result": (
+            "CHECKOUT_LOADED"
+            if checkout_success
+            else "FEE_NEXT_FIRED"
+            if fee_success
+            else "ATTENDEE_NEXT_FIRED"
+            if attendee_success
+            else "BOOKING_ACTION_FIRED"
+            if success
+            else "FAILED"
+        ),
+    }
+
+    if commit_to_action_ms != "":
+        print(
+            "Commit -> action   :",
+            f"{commit_to_action_ms:.2f} ms",
+        )
+
+    print()
+    print("Saving run log...")
+    record_run_log(run_log)
+    print()
 
     input("Press Enter to close...")
     browser.close()
