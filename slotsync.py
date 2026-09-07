@@ -14,7 +14,7 @@ from pathlib import Path
 URL = ""
 TORONTO_TZ = ZoneInfo("America/Toronto")
 
-FIRST_REFRESH_EARLY_MS = 100
+FIRST_REFRESH_EARLY_MS = 250
 STATE_DETECTION_TIMEOUT_MS = 1000
 
 SESSION_KEEPALIVE_SECONDS = 180
@@ -1702,32 +1702,29 @@ def wait_for_checkout(
 
     print("Checkout loaded.")
 
-    # ---------------------------------------------------------
-    # PLACE MY ORDER — INTENTIONALLY DISABLED FOR NOW
-    # ---------------------------------------------------------
-    #
-    # checkout_frame = page.frame_locator(
-    #     "iframe.online-store"
-    # )
-    #
-    # place_order_button = (
-    #     checkout_frame.get_by_role(
-    #         "button",
-    #         name="Place My Order",
-    #         exact=True,
-    #     )
-    # )
-    #
-    # place_order_button.wait_for(
-    #     state="visible",
-    #     timeout=15000,
-    # )
-    #
-    # place_order_button.click()
-    #
-    # print("PLACE MY ORDER FIRED")
-    #
-    # ---------------------------------------------------------
+    
+    checkout_frame = page.frame_locator(
+        "iframe.online-store"
+    )
+    
+    place_order_button = (
+        checkout_frame.get_by_role(
+            "button",
+            name="Place My Order",
+            exact=True,
+        )
+    )
+    
+    place_order_button.wait_for(
+        state="visible",
+        timeout=15000,
+    )
+    
+    place_order_button.click()
+    
+    print("PLACE MY ORDER FIRED")
+    
+    
 
     return True
 
