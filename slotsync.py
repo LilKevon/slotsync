@@ -10,6 +10,7 @@ from playwright.sync_api import (
 )
 
 from pathlib import Path
+from urllib.parse import urlsplit
 # Configuration
 URL = ""
 TORONTO_TZ = ZoneInfo("America/Toronto")
@@ -115,6 +116,7 @@ def looks_logged_out(page):
 
     except Exception:
         return False
+
 
 
 def login_to_perfectmind(
@@ -322,6 +324,7 @@ def open_slotsync_session(browser):
             context = browser.new_context(
                 storage_state=str(auth_file)
             )
+
             page = context.new_page()
 
             page.goto(
@@ -1675,6 +1678,74 @@ def select_free_activity_pass_and_continue(
     return True
 
 
+
+def attach_checkout_submit_diagnostics(page):
+    """
+    Log only final-checkout failures:
+      - failed requests
+      - HTTP responses >= 400
+      - uncaught page errors
+
+    Query strings are stripped so checkout tokens/IDs are not printed.
+    """
+    try:
+        if getattr(
+            page,
+            "_slotsync_checkout_diagnostics_attached",
+            False,
+        ):
+            return
+
+        page._slotsync_checkout_diagnostics_attached = True
+    except Exception:
+        pass
+
+    def safe_url(raw_url):
+        try:
+            parsed = urlsplit(raw_url)
+            return (
+                f"{parsed.scheme}://"
+                f"{parsed.netloc}"
+                f"{parsed.path}"
+            )
+        except Exception:
+            return "<redacted URL>"
+
+    def on_request_failed(request):
+        try:
+            print(
+                "CHECKOUT REQUEST FAILED:",
+                safe_url(request.url),
+                "|",
+                request.failure,
+            )
+        except Exception:
+            pass
+
+    def on_response(response):
+        try:
+            if response.status >= 400:
+                print(
+                    "CHECKOUT HTTP ERROR:",
+                    response.status,
+                    safe_url(response.url),
+                )
+        except Exception:
+            pass
+
+    def on_page_error(error):
+        try:
+            print(
+                "CHECKOUT PAGE ERROR:",
+                str(error),
+            )
+        except Exception:
+            pass
+
+    page.on("requestfailed", on_request_failed)
+    page.on("response", on_response)
+    page.on("pageerror", on_page_error)
+
 def wait_for_checkout(
     page,
     timeout_ms=20000,
@@ -1702,6 +1773,9 @@ def wait_for_checkout(
 
     print("Checkout loaded.")
 
+    # Only final-checkout failures are logged from this point onward.
+    attach_checkout_submit_diagnostics(page)
+
     
     checkout_frame = page.frame_locator(
         "iframe.online-store"
@@ -1720,8 +1794,46 @@ def wait_for_checkout(
         timeout=15000,
     )
     
+    print("Waiting for reCAPTCHA to initialize...")
+
+    deadline = time.monotonic() + 15
+
+    recaptcha_ready = False
+
+    while time.monotonic() < deadline:
+        try:
+            recaptcha_ready = checkout_frame.locator(
+                "body"
+            ).evaluate(
+                """
+                () => {
+                    return (
+                        typeof window.grecaptcha !== "undefined"
+                        && typeof window.grecaptcha.ready === "function"
+                        && typeof window.grecaptcha.execute === "function"
+                    );
+                }
+                """
+            )
+
+            if recaptcha_ready:
+                break
+
+        except Exception:
+            pass
+
+        time.sleep(0.10)
+
+    if not recaptcha_ready:
+        print(
+            "ERROR: reCAPTCHA did not initialize. "
+            "Place My Order will not be pressed."
+        )
+        return False
+
+    print("reCAPTCHA initialized.")
+
     place_order_button.click()
-    
     print("PLACE MY ORDER FIRED")
     
     
@@ -1729,7 +1841,10 @@ def wait_for_checkout(
     return True
 
 with sync_playwright() as p:
-    browser = p.chromium.launch(headless=False)
+    browser = p.chromium.launch(
+    channel="chrome",
+    headless=False,
+)
 
     context, page, AUTH_FILE = (
         open_slotsync_session(browser)
