@@ -1796,6 +1796,8 @@ def wait_for_checkout(
     
     print("Waiting for reCAPTCHA to initialize...")
 
+    time.sleep(3.0)
+    
     deadline = time.monotonic() + 15
 
     recaptcha_ready = False
