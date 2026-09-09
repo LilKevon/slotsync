@@ -1750,12 +1750,7 @@ def wait_for_checkout(
     page,
     timeout_ms=20000,
 ):
-    """
-    Wait for the checkout page and its embedded online-store frame.
-
-    The final Place My Order action is intentionally left commented
-    out for now.
-    """
+   
 
     try:
         page.locator(
@@ -1835,9 +1830,26 @@ def wait_for_checkout(
 
     print("reCAPTCHA initialized.")
 
+    checkout_frame = page.frame_locator("iframe.online-store")
+
+    place_order_button = checkout_frame.get_by_role(
+        "button",
+        name="Place My Order",
+        exact=True
+    )
+
     place_order_button.click()
-    print("PLACE MY ORDER FIRED")
-    
+    print("PLACE MY ORDER CLICK 1")
+
+    try:
+        place_order_button.wait_for(state="hidden", timeout=10000)
+        print("Place My Order accepted on first click.")
+    except:
+        if place_order_button.is_visible():
+            print("Place My Order still visible — retrying.")
+            place_order_button.click()
+            print("PLACE MY ORDER CLICK 2")
+        
     
 
     return True
